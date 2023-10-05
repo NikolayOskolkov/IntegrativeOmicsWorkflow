@@ -1,4 +1,4 @@
-![Logo](aMeta.png)
+![Integrative Omics workflow overview](BoostInPrediction.png)
 # IntegrativeOmicsWorkflow
 Here we provide a primer-workflow for biological data integration analysis.
 
