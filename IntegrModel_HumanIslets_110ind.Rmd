@@ -1,0 +1,884 @@
+---
+title: "Integrative OMICs Analysis for Human Pancreatic Islets"
+author: "Nikolay Oskolkov, SciLifeLab, NBIS Long Term Support, nikolay.oskolkov@scilifelab.se"
+date: "January 21, 2020"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+subtitle: PI Charlotte Ling, Lund University
+abstract: |
+  Here we will use all available sources of molecular and clinical information, i.e. OMICs data, for building a linear data integration model using the DIABLO method from mixOmics Bioconductor package that essentially represents a multi-modal extension of the PLS-DA model. The analysis will be done for 110 selected individuals with overlapping OMICs. Accuracy of T2D classification will be addressed as a criterian of integration and the confidence intervals of the prediction will be built by random splitting the 110 individuals data set into train and test multiple times.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="/home/nikolay/WABI/C_Ling/Analysis_110ind_Selected/")
+```
+
+
+### The List of 110 Selected Individuals
+
+All the analysis will be performed on the 110 individuals which were selected based on multiple criteria such as 1) they are either normo-glycimic or hyper-glycemic / T2D individuals, 2) they have information from all the 4 OMICS (methylation, transcriptomics, phenotypes, genotypes), 3) they all fall within the same age category, and a few other minor criteria. Now we will read the list of those 110 individuals and display a few of them:
+
+```{r}
+set.seed(1)
+selected_ind<-scan("OVERLAPPING_110_SAMPLES_4OMICS.txt", what = "charater")
+selected_ind<-paste0("ID",selected_ind)
+print(head(selected_ind, 20))
+print(tail(selected_ind, 20))
+```
+
+### Preparing Data for Feature Pre-Selection
+
+Here we are going to read each of the 4 OMICs data sets and perform some basic filtering and harmonization for further Feature Pre-Selection step. This step is needed in order to avoid the Curse of Dimensionality problem, i.e. we need to reduce dimensions of each OMIC before putting them together into the integrative DIABLO PLS-DA model.
+
+We start with loading expression, methylation, genotype and phenotype data sets for the selected 110 individuals with all 4 OMICs overlapping. Previously those OMICs were cleaned, log-transformed and prepared for integration.
+
+```{r reading expression matrix,fig.width=10,fig.height=8}
+library("matrixStats")
+expr<-read.table("Integr_Expr.txt",header=TRUE,row.names=1,check.names=FALSE,sep="\t")
+#expr<-as.data.frame(t(expr))
+#hist(rowSds(as.matrix(expr)),breaks=100,xlab="SD OF GENE EXPRESSION",
+#     main="Histogram of Standard Deviation in Gene Expression")
+#expr<-expr[rowSds(as.matrix(expr))>0.4,]
+expr[1:5,1:5]
+dim(expr)
+```
+
+Now let us read the matrix of methylation levels and have a look at the data. 
+
+```{r reading methylation matrix}
+library("data.table")
+meth<-suppressWarnings(as.data.frame(fread("Integr_Meth.txt")))
+rownames(meth)<-meth$V1
+meth$V1<-NULL
+#meth<-as.data.frame(t(meth))
+#hist(rowSds(as.matrix(meth)),breaks=100,xlab="SD OF METHYLATION",
+#     main="Histogram of Standard Deviation in Methylation")
+#meth<-meth[rowSds(as.matrix(meth))>0.05,]
+meth[1:5,1:5]
+dim(meth)
+```
+
+Next, we will read the matrix of GWAS genetic variants:
+
+```{r}
+gen<-read.delim("Integr_Gen.txt",header=TRUE,sep="\t",row.names=1,check.names=FALSE)
+#gen<-as.data.frame(t(gen))
+gen[1:5,1:5]
+dim(gen)
+```
+
+And finally let us read phenotypic data:
+
+```{r}
+phen<-read.delim("Integr_Phen.txt",header=TRUE,sep="\t",row.names=1,check.names=FALSE)
+#phen<-as.data.frame(t(phen))
+phen[1:4,1:4]
+dim(phen)
+```
+
+We will also read the vector of T2D status for the selected 110 individuals, we will use this for supervision of the DIABLO integration.
+
+```{r}
+T2D<-read.delim("Integr_T2D.txt",header=TRUE,row.names=1,check.names=FALSE,sep="\t")
+head(T2D)
+dim(T2D)
+```
+
+It is useful to display the Venn Diagram of overlapping samples of the full OMICs data sets before doing integrative analysis:
+
+```{r,fig.width=10,fig.height=8}
+library("VennDiagram")
+v<-venn.diagram(list(expr=rownames(expr), phen=rownames(phen), meth=rownames(meth), gen=rownames(gen)),fill = c("orange", "blue","red","green"),alpha = c(0.5, 0.5, 0.5, 0.5), cat.cex = 1.5, cex=1.5, filename=NULL)
+grid.newpage()
+grid.draw(v)
+```
+
+We can see that the overlap between all 4 OMICs is 110 samples.
+
+
+### DIABLO OMICS Integration
+
+Now we will start integrating the three OMICs: 1) gene expression, 2) methylation and 3) clinical phenotypes. For this purpose we will concatenate gene expression, methylation and phenotype matrices into X matrix and use the T2D status as Y variable, so it is a typical Machine Learning setup: y=f(x), where x is the input, y is the class labels of individuals and the f-function is learnt from the data. We will be using DIABLO model from the mixOmics R packages (Kim-Anh Le Kao is the leader of the project), that is based on multi-block PLS model. To avoid the Curse of Dimensionality, we will pre-select features before integrating them. We build and train the integrative OMICs DIABLO model (as well as feature pre-selection) using train data set (80% of data) and make predictions on a test data set (20% of data).
+
+```{r,fig.width=10,fig.height=8}
+k<-1
+library("mixOmics")
+set.seed(k+100)
+test_samples<-selected_ind[sample(1:length(selected_ind),round(length(selected_ind)*0.2))]
+train_samples<-selected_ind[!selected_ind%in%test_samples]
+  
+Y.train<-as.factor(as.character(T2D[match(train_samples,rownames(T2D)),]))
+Y.test<-as.factor(as.character(T2D[match(test_samples,rownames(T2D)),]))
+  
+X.train_expr<-expr[match(train_samples,rownames(expr)),]
+X.test_expr<-expr[match(test_samples,rownames(expr)),]
+expr_plsda<-plsda(X.train_expr, Y.train, ncomp=2)
+features_expr1<-names(head(sort(abs(expr_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+features_expr2<-names(head(sort(abs(expr_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+X.train_expr_selected_features<-subset(X.train_expr,select=unique(c(features_expr1, features_expr2)))
+X.test_expr_selected_features<-subset(X.test_expr,select=unique(c(features_expr1, features_expr2)))
+  
+X.train_meth<-meth[match(train_samples,rownames(meth)),]
+X.test_meth<-meth[match(test_samples,rownames(meth)),]
+meth_plsda<-plsda(X.train_meth, Y.train, ncomp=2)
+features_meth1<-names(head(sort(abs(meth_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+features_meth2<-names(head(sort(abs(meth_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+X.train_meth_selected_features<-subset(X.train_meth,select=unique(c(features_meth1, features_meth2)))
+X.test_meth_selected_features<-subset(X.test_meth,select=unique(c(features_meth1, features_meth2)))
+  
+X.train_gen<-gen[match(train_samples,rownames(gen)),]
+X.test_gen<-gen[match(test_samples,rownames(gen)),]
+gen_plsda<-plsda(X.train_gen, Y.train, ncomp=2)
+features_gen1<-names(head(sort(abs(gen_plsda$loadings$X[,"comp1"]),decreasing=TRUE),20))
+features_gen2<-names(head(sort(abs(gen_plsda$loadings$X[,"comp2"]),decreasing=TRUE),20))
+X.train_gen_selected_features<-subset(X.train_gen,select=unique(c(features_gen1, features_gen2)))
+X.test_gen_selected_features<-subset(X.test_gen,select=unique(c(features_gen1, features_gen2)))
+  
+X.train_phen<-phen[match(train_samples,rownames(phen)),]
+X.test_phen<-phen[match(test_samples,rownames(phen)),]
+  
+data.train<-list(expr=X.train_expr_selected_features, meth=X.train_meth_selected_features, 
+                 gen=X.train_gen_selected_features, phen=X.train_phen)
+design=matrix(0.1, ncol=length(data.train), nrow=length(data.train), 
+              dimnames=list(names(data.train),names(data.train)))
+diag(design)=0
+design["expr","meth"]<-0.1
+design["meth","expr"]<-0.1
+design["meth","phen"]<-0.01
+design["phen","meth"]<-0.01
+design["expr","gen"]<-0.01
+design["gen","expr"]<-0.01
+design["meth","gen"]<-0.01
+design["gen","meth"]<-0.01
+  
+ncomp=2
+list.keepX = list("expr"=c(30,30), "meth"=c(30,30), "gen"=c(10,10), "phen"=c(4,4))
+res = block.splsda(X=data.train,Y=Y.train,ncomp=ncomp,keepX=list.keepX,design=design,
+                   scheme="horst",mode="regression",init="svd.single",near.zero.var=TRUE)
+  
+plotIndiv(res,legend=TRUE,title="Human Pancreatic Islets: Individual Omics",ellipse=FALSE,ind.names=TRUE,cex=3)
+plotArrow(res,ind.names=TRUE,legend=TRUE,title="Human Pancreatic Islets: Consensus Across Omics")
+plotVar(res,var.names=TRUE,style='graphics',legend=TRUE,pch=c(16,17,18,19),cex=c(0.8,0.8,0.8,0.8),col=c('blue','red2',"darkgreen","cyan"))
+circosPlot(res,cutoff=0.7,line=FALSE,size.variables=0.5)
+cimDiablo(res,margins=c(11,18))
+network(res,blocks=c(1,2),cex.node.name=0.6,color.node=c('blue','red2'),breaks=NULL)
+network(res,blocks=c(1,3),cex.node.name=0.6,color.node=c('blue','darkgreen'),breaks=NULL)
+network(res,blocks=c(1,4),cex.node.name=0.6,color.node=c('blue','cyan'),breaks=NULL)
+network(res,blocks=c(2,3),cex.node.name=0.6,color.node=c('red2','darkgreen'),breaks=NULL)
+network(res,blocks=c(2,4),cex.node.name=0.6,color.node=c('red2','cyan'),breaks=NULL)
+network(res,blocks=c(3,4),cex.node.name=0.6,color.node=c('darkgreen','cyan'),breaks=NULL)
+
+
+
+data.test<-list(expr=X.test_expr_selected_features, meth=X.test_meth_selected_features, 
+                gen=X.test_gen_selected_features, phen=X.test_phen)
+predict.diablo=predict(res, newdata=data.test, dist='centroids.dist')
+print(data.frame(predict.diablo$class,Truth=Y.test))
+```
+
+The network, circus and arrow plots provide an interpretation of the integrative model, i.e. we can see the linkage between the features across the 4 OMICs and potentially can understand the biological interplay between the different layers of information. Let us now display what the integrative model classifier has learnt and let us see how it can classify the new data points from the test data set.
+
+```{r,fig.width=10,fig.height=8}
+df1<-data.frame(expr=res$variates$expr[,"comp1"],meth=res$variates$meth[,"comp1"],gen=res$variates$gen[,"comp1"],phen=res$variates$phen[,"comp1"])
+av1<-rowMeans(df1)
+df2<-data.frame(expr=res$variates$expr[,"comp2"],meth=res$variates$meth[,"comp2"],gen=res$variates$gen[,"comp2"],phen=res$variates$phen[,"comp2"])
+av2<-rowMeans(df2)
+
+train_df<-data.frame(x=as.numeric(av1),y=as.numeric(av2),label=Y.train)
+train_df$color<-ifelse(train_df$label==0,"blue","red")
+
+plot(train_df$x,train_df$y,col=train_df$color,xlab="PLS LATENT DIMENSION 1",ylab="PLS LATENT DIMENSION 2")
+legend("topleft", inset=.02, c("Diabetics","Non-Diabetics"), fill=c("red","blue"))
+train_df$color<-NULL
+
+mdl <- glm(as.factor(label)~ ., data=train_df, family=binomial)
+slope <- coef(mdl)[2]/(-coef(mdl)[3])
+intercept <- coef(mdl)[1]/(-coef(mdl)[3]) 
+abline(intercept, slope, col="darkorange", lwd=2)
+ 
+ 
+df1pred<-data.frame(expr=predict.diablo$variates$expr[,"dim1"],meth=predict.diablo$variates$meth[,"dim1"],gen=predict.diablo$variates$gen[,"dim1"],phen=predict.diablo$variates$phen[,"dim1"])
+av1pred<-rowMeans(df1pred)
+df2pred<-data.frame(expr=predict.diablo$variates$expr[,"dim2"],meth=predict.diablo$variates$meth[,"dim2"],gen=predict.diablo$variates$gen[,"dim2"],phen=predict.diablo$variates$phen[,"dim2"])
+av2pred<-rowMeans(df2pred)
+
+test_df<-data.frame(x=as.numeric(av1pred),y=as.numeric(av2pred),label=Y.test)
+test_df$color<-ifelse(test_df$label==0,"blue","red")
+ 
+points(test_df$x,test_df$y,col=test_df$color,pch=19)
+```
+
+Now let us calculate some prediction metrics such as the accuracy of prediction, meaning the fraction of times we predict the T2D status correctly:
+
+```{r}
+DIABLO_predict1<-predict.diablo$MajorityVote$centroids.dist[,1]
+if(any(is.na(DIABLO_predict1))==TRUE)
+{
+  failed_samples1<-names(DIABLO_predict1)[is.na(DIABLO_predict1)==TRUE]
+  for(s1 in failed_samples1)
+  {
+    if(as.numeric(predict.diablo$class$centroids.dist$expr[,1][s1])==as.numeric(predict.diablo$class$centroids.dist$meth[,1][s1]))
+    {
+      DIABLO_predict1[s1]<-predict.diablo$class$centroids.dist$expr[,1][s1]
+    }
+  }
+}
+conf_matrix_comp1<-table(DIABLO_predict1,Y.test)
+print(conf_matrix_comp1)
+acc1<-round((sum(diag(conf_matrix_comp1))/sum(conf_matrix_comp1))*100)
+print(paste0("Classification Accuracy from DIABLO Component 1: ", acc1))
+  
+DIABLO_predict2<-predict.diablo$MajorityVote$centroids.dist[,2]
+if(any(is.na(DIABLO_predict2))==TRUE)
+{
+  failed_samples2<-names(DIABLO_predict2)[is.na(DIABLO_predict2)==TRUE]
+  for(s2 in failed_samples2)
+  {
+    if(as.numeric(predict.diablo$class$centroids.dist$expr[,2][s2])==as.numeric(predict.diablo$class$centroids.dist$meth[,2][s2]))
+    {
+      DIABLO_predict2[s2]<-predict.diablo$class$centroids.dist$expr[,2][s2]
+    }
+  }
+}
+conf_matrix_comp2<-table(DIABLO_predict2,Y.test)
+print(conf_matrix_comp2)
+acc2<-round((sum(diag(conf_matrix_comp2))/sum(conf_matrix_comp2))*100)
+print(paste0("Classification Accuracy from DIABLO Component 2: ", acc2))
+```
+
+We can see that the accuracy of prediction is very high, however, since our data set is unbalanced, it is not a very good idea to use accuracy as an ultimate metric of model evaluation. Therefore, let us plot the ROC curve of DIABLO prediction and compare predictions from DIABLO component 1 and component 2:
+
+```{r,fig.width=10,fig.height=8}
+library("ROCit")
+
+DIABLO_predict1_expr<-predict.diablo$predict$expr[,,1][,2]
+DIABLO_predict1_meth<-predict.diablo$predict$meth[,,1][,2]
+DIABLO_predict1_gen<-predict.diablo$predict$gen[,,1][,2]
+DIABLO_predict1_phen<-predict.diablo$predict$phen[,,1][,2]
+DIABLO_predict1_score<-rowMeans(data.frame(DIABLO_predict1_expr,DIABLO_predict1_meth,DIABLO_predict1_gen,DIABLO_predict1_phen))
+roc_obj1<-rocit(as.numeric(DIABLO_predict1_score),as.numeric(as.character(Y.test)))
+roc_obj1
+my_auc1<-0.07142857*0.375+0.07142857*0.5+(1-0.14285714)*1
+my_auc1
+plot(roc_obj1$FPR,roc_obj1$TPR,col="red",type="o",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",pch=19)
+
+DIABLO_predict1_integr<-data.frame(DIABLO_predict1_score,DIABLO_predict1_expr,DIABLO_predict1_meth,DIABLO_predict1_gen,DIABLO_predict1_phen,Y.test)
+DIABLO_predict1_integr<-DIABLO_predict1_integr[order(-as.numeric(DIABLO_predict1_integr$DIABLO_predict1_score)),]
+DIABLO_predict1_integr
+
+DIABLO_predict2_expr<-predict.diablo$predict$expr[,,2][,2]
+DIABLO_predict2_meth<-predict.diablo$predict$meth[,,2][,2]
+DIABLO_predict2_gen<-predict.diablo$predict$gen[,,2][,2]
+DIABLO_predict2_phen<-predict.diablo$predict$phen[,,2][,2]
+DIABLO_predict2_score<-rowMeans(data.frame(DIABLO_predict2_expr,DIABLO_predict2_meth,DIABLO_predict2_gen,DIABLO_predict2_phen))
+roc_obj2<-rocit(as.numeric(DIABLO_predict2_score),as.numeric(as.character(Y.test)))
+roc_obj2
+lines(roc_obj2$FPR,roc_obj2$TPR,col="blue",type="o",pch=19)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright",legend=c(paste0("DIABLO COMP1 AUC = ",round(roc_obj1$AUC,2)),paste0("DIABLO COMP2 AUC = ",round(roc_obj2$AUC,2))),col=c("red","blue"),inset=0.02,lty=c(1,1))
+
+DIABLO_predict2_integr<-data.frame(DIABLO_predict2_score,DIABLO_predict2_expr,DIABLO_predict2_meth,DIABLO_predict2_gen,DIABLO_predict2_phen,Y.test)
+DIABLO_predict2_integr<-DIABLO_predict2_integr[order(-as.numeric(DIABLO_predict2_integr$DIABLO_predict2_score)),]
+DIABLO_predict2_integr
+
+#roc_obj<-rocit(as.numeric(DIABLO_predict1),as.numeric(as.character(Y.test)))
+#plot(roc_obj$FPR,roc_obj$TPR,col="red",type="o",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)")
+#lines(c(0,1),c(0,1),col="black")
+#roc_obj_expr<-rocit(as.numeric(DIABLO_predict1_expr),as.numeric(as.character(Y.test)))
+#lines(roc_obj_expr$FPR,roc_obj_expr$TPR,col="blue",type="o")
+#roc_obj_meth<-rocit(as.numeric(DIABLO_predict1_meth),as.numeric(as.character(Y.test)))
+#lines(roc_obj_meth$FPR,roc_obj_meth$TPR,col="green",type="o")
+#roc_obj_gen<-rocit(as.numeric(DIABLO_predict1_gen),as.numeric(as.character(Y.test)))
+#lines(roc_obj_gen$FPR,roc_obj_gen$TPR,col="magenta",type="o")
+#roc_obj_phen<-rocit(as.numeric(DIABLO_predict1_phen),as.numeric(as.character(Y.test)))
+#lines(roc_obj_phen$FPR,roc_obj_phen$TPR,col="cyan",type="o")
+#legend("bottomright",legend=c("DIABLO","EXPR","METH","GEN","PHEN"),col=c("red","blue","green","magenta","cyan"),
+#       inset=0.02,lty=c(1,1,1,1,1))
+```
+
+We conclude that DIABLO component 2 is more predictive than component 1, that is also confirmed by the higher accuracy of T2D vs. NonT2D classification. The training and evaluation of the model has been performed on one train-test split (so-called holdd-out cross-validartion). Now we are going to do this split multiple times and average the prediction metrics such as accuracy and ROC-curve. In this way we will build confidence intervals for the T2D status prediction.
+
+
+### Building Confidence Intervals for DIABLO Integrative Model
+
+Here we are going to build a loop where we split the 110 individuals into train and test set multiple times (hold-out cross-vlaidation in Machine Learning terminology). Within each split we will run an sPLS-DA model for each OMIC on the train data set only and use the pre-selected features for integrating the 4 OMICs with DIABLO. The results of the integration will be validated multiple times on the test data set in terms of the accuracy of the prediction. In this way we will build confidence intervals for the accuracy of prediction and ROC curve of prediction.
+
+```{r DIABLO conf interval,fig.width=10,fig.height=8,eval=TRUE}
+N_repeat<-100
+library("mixOmics")
+library("ROCit")
+library("matrixStats")
+
+comp1_auc<-vector()
+comp1_tpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_auc_expr<-vector()
+comp1_tpr_expr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr_expr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_auc_meth<-vector()
+comp1_tpr_meth<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr_meth<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_auc_gen<-vector()
+comp1_tpr_gen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr_gen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_auc_phen<-vector()
+comp1_tpr_phen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr_phen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+
+comp2_auc<-vector()
+comp2_tpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_auc_expr<-vector()
+comp2_tpr_expr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr_expr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_auc_meth<-vector()
+comp2_tpr_meth<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr_meth<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_auc_gen<-vector()
+comp2_tpr_gen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr_gen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_auc_phen<-vector()
+comp2_tpr_phen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr_phen<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+
+comp1_acc<-vector(); comp2_acc<-vector()
+for(k in 1:N_repeat)
+{
+  print(paste0("Working with split No.", k))
+  gc()
+  set.seed(k+100)
+  test_samples<-selected_ind[sample(1:length(selected_ind),round(length(selected_ind)*0.2))]
+  train_samples<-selected_ind[!selected_ind%in%test_samples]
+  
+  Y.train<-as.factor(as.character(T2D[match(train_samples,rownames(T2D)),]))
+  Y.test<-as.factor(as.character(T2D[match(test_samples,rownames(T2D)),]))
+  
+  X.train_expr<-expr[match(train_samples,rownames(expr)),]
+  X.test_expr<-expr[match(test_samples,rownames(expr)),]
+  expr_plsda<-plsda(X.train_expr, Y.train, ncomp=2)
+  features_expr1<-names(head(sort(abs(expr_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+  features_expr2<-names(head(sort(abs(expr_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+  X.train_expr_selected_features<-subset(X.train_expr,select=unique(c(features_expr1, features_expr2)))
+  X.test_expr_selected_features<-subset(X.test_expr,select=unique(c(features_expr1, features_expr2)))
+  
+  X.train_meth<-meth[match(train_samples,rownames(meth)),]
+  X.test_meth<-meth[match(test_samples,rownames(meth)),]
+  meth_plsda<-plsda(X.train_meth, Y.train, ncomp=2)
+  features_meth1<-names(head(sort(abs(meth_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+  features_meth2<-names(head(sort(abs(meth_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+  X.train_meth_selected_features<-subset(X.train_meth,select=unique(c(features_meth1, features_meth2)))
+  X.test_meth_selected_features<-subset(X.test_meth,select=unique(c(features_meth1, features_meth2)))
+  
+  X.train_gen<-gen[match(train_samples,rownames(gen)),]
+  X.test_gen<-gen[match(test_samples,rownames(gen)),]
+  gen_plsda<-plsda(X.train_gen, Y.train, ncomp=2)
+  features_gen1<-names(head(sort(abs(gen_plsda$loadings$X[,"comp1"]),decreasing=TRUE),20))
+  features_gen2<-names(head(sort(abs(gen_plsda$loadings$X[,"comp2"]),decreasing=TRUE),20))
+    X.train_gen_selected_features<-subset(X.train_gen,select=unique(c(features_gen1, features_gen2)))
+  X.test_gen_selected_features<-subset(X.test_gen,select=unique(c(features_gen1, features_gen2)))
+  
+  X.train_phen<-phen[match(train_samples,rownames(phen)),]
+  X.test_phen<-phen[match(test_samples,rownames(phen)),]
+  
+  data.train<-list(expr=X.train_expr_selected_features, meth=X.train_meth_selected_features, 
+                   gen=X.train_gen_selected_features, phen=X.train_phen)
+  design=matrix(0.1, ncol=length(data.train), nrow=length(data.train), 
+                dimnames=list(names(data.train),names(data.train)))
+  diag(design)=0
+  design["expr","meth"]<-0.1
+  design["meth","expr"]<-0.1
+  design["meth","phen"]<-0.01
+  design["phen","meth"]<-0.01
+  design["expr","gen"]<-0.01
+  design["gen","expr"]<-0.01
+  design["meth","gen"]<-0.01
+  design["gen","meth"]<-0.01
+  
+  ncomp=2
+  list.keepX = list("expr"=c(30,30), "meth"=c(30,30), "gen"=c(5,5), "phen"=c(4,4))
+  #tune = tune.block.splsda(X=data.train,Y=Y.train,ncomp=ncomp,test.keepX=list.keepX,design=design,nrepeat=3,folds=2)
+  res = block.splsda(X=data.train,Y=Y.train,ncomp=ncomp,keepX=list.keepX,design=design,
+                     scheme="horst",mode="regression",init="svd.single",near.zero.var=TRUE)
+  
+  data.test<-list(expr=X.test_expr_selected_features, meth=X.test_meth_selected_features, 
+                  gen=X.test_gen_selected_features, phen=X.test_phen)
+  predict.diablo=predict(res, newdata=data.test, dist='centroids.dist')
+  #print(data.frame(predict.diablo$class,Truth=Y.test))
+  
+  DIABLO_predict1_expr<-predict.diablo$predict$expr[,,1][,2]
+  DIABLO_predict1_meth<-predict.diablo$predict$meth[,,1][,2]
+  DIABLO_predict1_gen<-predict.diablo$predict$gen[,,1][,2]
+  DIABLO_predict1_phen<-predict.diablo$predict$phen[,,1][,2]
+  DIABLO_predict1_score<-rowWeightedMeans(as.matrix(data.frame(DIABLO_predict1_expr,DIABLO_predict1_meth,
+                                                     DIABLO_predict1_gen,DIABLO_predict1_phen)),w=c(1,0.8,0.1,0.1))
+  names(DIABLO_predict1_score)<-names(DIABLO_predict1_expr)
+  DIABLO_predict1<-predict.diablo$MajorityVote$centroids.dist[,1]
+  if(any(is.na(DIABLO_predict1))==TRUE)
+  {
+    failed_samples1<-names(DIABLO_predict1)[is.na(DIABLO_predict1)==TRUE]
+    for(s1 in failed_samples1)
+    {
+      if(as.numeric(predict.diablo$class$centroids.dist$expr[,1][s1])==as.numeric(predict.diablo$class$centroids.dist$meth[,1][s1]))
+      {
+        DIABLO_predict1[s1]<-predict.diablo$class$centroids.dist$expr[,1][s1]
+      }
+      DIABLO_predict1_score[s1]<-predict.diablo$predict$expr[,,1][,2][s1]
+    }
+    #DIABLO_predict1[failed_samples1]<-predict.diablo$class$centroids.dist$expr[,1][failed_samples1]
+  }
+  conf_matrix_comp1<-table(DIABLO_predict1,Y.test)
+  print(conf_matrix_comp1)
+  acc1<-round((sum(diag(conf_matrix_comp1))/sum(conf_matrix_comp1))*100)
+  comp1_acc<-append(comp1_acc,acc1)
+  print(paste0("Classification Accuracy from PLS Component 1: ", acc1))
+  roc_obj1<-rocit(as.numeric(DIABLO_predict1_score),as.numeric(as.character(Y.test)))
+  roc_obj1_expr<-rocit(as.numeric(DIABLO_predict1_expr),as.numeric(as.character(Y.test)))
+  roc_obj1_meth<-rocit(as.numeric(DIABLO_predict1_meth),as.numeric(as.character(Y.test)))
+  roc_obj1_gen<-rocit(as.numeric(DIABLO_predict1_gen),as.numeric(as.character(Y.test)))
+  roc_obj1_phen<-rocit(as.numeric(DIABLO_predict1_phen),as.numeric(as.character(Y.test)))
+  comp1_auc<-append(comp1_auc,roc_obj1$AUC)
+  comp1_auc_expr<-append(comp1_auc_expr,roc_obj1_expr$AUC)
+  comp1_auc_meth<-append(comp1_auc_meth,roc_obj1_meth$AUC)
+  comp1_auc_gen<-append(comp1_auc_gen,roc_obj1_gen$AUC)
+  comp1_auc_phen<-append(comp1_auc_phen,roc_obj1_phen$AUC)
+  print(paste0("Classification ROC AUC from DIABLO Component 1: ", roc_obj1$AUC))
+  print(paste0("Classification ROC AUC from Expression Component 1: ", roc_obj1_expr$AUC))
+  print(paste0("Classification ROC AUC from Methylation Component 1: ", roc_obj1_meth$AUC))
+  print(paste0("Classification ROC AUC from Genotype Component 1: ", roc_obj1_gen$AUC))
+  print(paste0("Classification ROC AUC from Phenotype Component 1: ", roc_obj1_phen$AUC))
+  comp1_tpr[k,]<-roc_obj1$TPR
+  comp1_fpr[k,]<-roc_obj1$FPR
+  comp1_tpr_expr[k,]<-roc_obj1_expr$TPR
+  comp1_fpr_expr[k,]<-roc_obj1_expr$FPR
+  comp1_tpr_meth[k,]<-roc_obj1_meth$TPR
+  comp1_fpr_meth[k,]<-roc_obj1_meth$FPR
+  comp1_tpr_gen[k,]<-roc_obj1_gen$TPR
+  comp1_fpr_gen[k,]<-roc_obj1_gen$FPR
+  comp1_tpr_phen[k,]<-roc_obj1_phen$TPR
+  comp1_fpr_phen[k,]<-roc_obj1_phen$FPR
+  
+  DIABLO_predict2_expr<-predict.diablo$predict$expr[,,2][,2]
+  DIABLO_predict2_meth<-predict.diablo$predict$meth[,,2][,2]
+  DIABLO_predict2_gen<-predict.diablo$predict$gen[,,2][,2]
+  DIABLO_predict2_phen<-predict.diablo$predict$phen[,,2][,2]
+  DIABLO_predict2_score<-rowWeightedMeans(as.matrix(data.frame(DIABLO_predict2_expr,DIABLO_predict2_meth,
+                                                     DIABLO_predict2_gen,DIABLO_predict2_phen)),w=c(1,0.8,0.1,0.1))
+  names(DIABLO_predict2_score)<-names(DIABLO_predict2_expr)
+  DIABLO_predict2<-predict.diablo$MajorityVote$centroids.dist[,2]
+  if(any(is.na(DIABLO_predict2))==TRUE)
+  {
+    failed_samples2<-names(DIABLO_predict2)[is.na(DIABLO_predict2)==TRUE]
+    for(s2 in failed_samples2)
+    {
+      if(as.numeric(predict.diablo$class$centroids.dist$expr[,2][s2])==as.numeric(predict.diablo$class$centroids.dist$meth[,2][s2]))
+      {
+        DIABLO_predict2[s2]<-predict.diablo$class$centroids.dist$expr[,2][s2]
+      }
+      DIABLO_predict2_score[s2]<-predict.diablo$predict$expr[,,2][,2][s2]
+    }
+    #DIABLO_predict2[failed_samples2]<-predict.diablo$class$centroids.dist$expr[,2][failed_samples2]
+  }
+  conf_matrix_comp2<-table(DIABLO_predict2,Y.test)
+  print(conf_matrix_comp2)
+  acc2<-round((sum(diag(conf_matrix_comp2))/sum(conf_matrix_comp2))*100)
+  comp2_acc<-append(comp2_acc,acc2)
+  print(paste0("Classification Accuracy from PLS Component 2: ", acc2))
+  roc_obj2<-rocit(as.numeric(DIABLO_predict2_score),as.numeric(as.character(Y.test)))
+  roc_obj2_expr<-rocit(as.numeric(DIABLO_predict2_expr),as.numeric(as.character(Y.test)))
+  roc_obj2_meth<-rocit(as.numeric(DIABLO_predict2_meth),as.numeric(as.character(Y.test)))
+  roc_obj2_gen<-rocit(as.numeric(DIABLO_predict2_gen),as.numeric(as.character(Y.test)))
+  roc_obj2_phen<-rocit(as.numeric(DIABLO_predict2_phen),as.numeric(as.character(Y.test)))
+  comp2_auc<-append(comp2_auc,roc_obj2$AUC)
+  comp2_auc_expr<-append(comp2_auc_expr,roc_obj2_expr$AUC)
+  comp2_auc_meth<-append(comp2_auc_meth,roc_obj2_meth$AUC)
+  comp2_auc_gen<-append(comp2_auc_gen,roc_obj2_gen$AUC)
+  comp2_auc_phen<-append(comp2_auc_phen,roc_obj2_phen$AUC)
+  print(paste0("Classification ROC AUC from DIABLO Component 2: ", roc_obj2$AUC))
+  print(paste0("Classification ROC AUC from Expression Component 2: ", roc_obj2_expr$AUC))
+  print(paste0("Classification ROC AUC from Methylation Component 2: ", roc_obj2_meth$AUC))
+  print(paste0("Classification ROC AUC from Genotype Component 2: ", roc_obj2_gen$AUC))
+  print(paste0("Classification ROC AUC from Phenotype Component 2: ", roc_obj2_phen$AUC))
+  comp2_tpr[k,]<-roc_obj2$TPR
+  comp2_fpr[k,]<-roc_obj2$FPR
+  comp2_tpr_expr[k,]<-roc_obj2_expr$TPR
+  comp2_fpr_expr[k,]<-roc_obj2_expr$FPR
+  comp2_tpr_meth[k,]<-roc_obj2_meth$TPR
+  comp2_fpr_meth[k,]<-roc_obj2_meth$FPR
+  comp2_tpr_gen[k,]<-roc_obj2_gen$TPR
+  comp2_fpr_gen[k,]<-roc_obj2_gen$FPR
+  comp2_tpr_phen[k,]<-roc_obj2_phen$TPR
+  comp2_fpr_phen[k,]<-roc_obj2_phen$FPR
+  
+  print("***********************************************************")
+}
+plot(colMeans(comp1_fpr),colMeans(comp1_tpr),col="red",type="o",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",pch=19)
+lines(colMeans(comp1_fpr_expr),colMeans(comp1_tpr_expr),col="blue",type="o",pch=19)
+lines(colMeans(comp1_fpr_meth),colMeans(comp1_tpr_meth),col="darkgreen",type="o",pch=19)
+lines(colMeans(comp1_fpr_gen),colMeans(comp1_tpr_gen),col="darkorange",type="o",pch=19)
+lines(colMeans(comp1_fpr_phen),colMeans(comp1_tpr_phen),col="magenta",type="o",pch=19)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright",legend=c(paste0("DIABLO COMP1 AUC = ",round(mean(comp1_auc),2)," +/- ",round(2*sd(comp1_auc),2)),paste0("EXPR COMP1 AUC = ",round(mean(comp1_auc_expr),2)," +/- ",round(2*sd(comp1_auc_expr),2)),paste0("METH COMP1 AUC = ",round(mean(comp1_auc_meth),2)," +/- ",round(2*sd(comp1_auc_meth),2)),paste0("GEN COMP1 AUC = ",round(mean(comp1_auc_gen),2)," +/- ",round(2*sd(comp1_auc_gen),2)),paste0("PHEN COMP1 AUC = ",round(mean(comp1_auc_phen),2)," +/- ",round(2*sd(comp1_auc_phen),2))),col=c("red","blue","darkgreen","darkorange","magenta"),inset=0.02,lty=c(1,1,1,1,1))
+
+plot(colMeans(comp2_fpr),colMeans(comp2_tpr),col="red",type="o",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",pch=19)
+lines(colMeans(comp2_fpr_expr),colMeans(comp2_tpr_expr),col="blue",type="o",pch=19)
+lines(colMeans(comp2_fpr_meth),colMeans(comp2_tpr_meth),col="darkgreen",type="o",pch=19)
+lines(colMeans(comp2_fpr_gen),colMeans(comp2_tpr_gen),col="darkorange",type="o",pch=19)
+lines(colMeans(comp2_fpr_phen),colMeans(comp2_tpr_phen),col="magenta",type="o",pch=19)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright",legend=c(paste0("DIABLO COMP2 AUC = ",round(mean(comp2_auc),2)," +/- ",round(2*sd(comp2_auc),2)),paste0("EXPR COMP2 AUC = ",round(mean(comp2_auc_expr),2)," +/- ",round(2*sd(comp2_auc_expr),2)),paste0("METH COMP2 AUC = ",round(mean(comp2_auc_meth),2)," +/- ",round(2*sd(comp2_auc_meth),2)),paste0("GEN COMP2 AUC = ",round(mean(comp2_auc_gen),2)," +/- ",round(2*sd(comp2_auc_gen),2)),paste0("PHEN COMP2 AUC = ",round(mean(comp2_auc_phen),2)," +/- ",round(2*sd(comp2_auc_phen),2))),col=c("red","blue","darkgreen","darkorange","magenta"),inset=0.02,lty=c(1,1,1,1,1))
+
+write.table(comp1_auc,file="Comp1_DIABLO_AUC.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_tpr,file="Comp1_DIABLO_TPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_fpr,file="Comp1_DIABLO_FPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_auc,file="Comp2_DIABLO_AUC.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_tpr,file="Comp2_DIABLO_TPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_fpr,file="Comp2_DIABLO_FPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_acc,file="Comp1_DIABLO_Acc.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_acc,file="Comp2_DIABLO_Acc.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+```
+
+Here we plot the histograms of the DIABLO prediction for components 1 and 2.
+
+```{r,fig.width=10,fig.height=8}
+gc()
+comp1_acc_arch<-as.numeric(scan("Comp1_DIABLO_Acc.txt",what="character"))
+comp2_acc_arch<-as.numeric(scan("Comp2_DIABLO_Acc.txt",what="character"))
+
+#comp1_acc_arch<-c(comp1_acc,comp1_acc_arch)
+#comp2_acc_arch<-c(comp2_acc,comp2_acc_arch)
+
+hist(comp1_acc_arch,breaks=20,xlab="ACCURACY",main="Accuracy T2D Prediction from DIABLO: PLS1",col="darkgreen",xlim=c(70,100))
+abline(v=71,col="red",lwd=5)
+mtext(paste0("Accuracy = ",mean(comp1_acc_arch)," +/- ",2*sd(comp1_acc_arch)))
+hist(comp2_acc_arch,breaks=20,xlab="ACCURACY",main="Accuracy T2D Prediction from DIABLO: PLS2",col="darkgreen",xlim=c(70,100))
+abline(v=71,col="red",lwd=5)
+mtext(paste0("Accuracy = ",mean(comp2_acc_arch)," +/- ",2*sd(comp2_acc_arch)))
+```
+
+Now we will access the significance of DIABLO prediction compared to the naive model that predicts every new individual to be a non-diabetic since the NonT2D is the majority class, this naive model would achieve a high accuracy of 71%.
+
+```{r}
+gc()
+sum(comp1_acc_arch<=71)/length(comp1_acc_arch)
+sum(comp2_acc_arch<=71)/length(comp2_acc_arch)
+```
+
+We conclude that the DIABLO predicts far better than the naive model. Now we will compare the accuracy of DIABLO prediction against the accuracy of predictions from the 4 individual OMICs.
+
+```{r,fig.width=10,fig.height=8}
+library("RColorBrewer")
+
+my_integr<-as.numeric(scan("Comp2_DIABLO_Acc.txt",what="character"))
+my_expr<-as.numeric(scan("Comp2_PLS_Expr_Acc.txt",what="character"))
+my_meth<-as.numeric(scan("Comp2_PLS_Meth_Acc.txt",what="character"))
+my_gen<-as.numeric(scan("Comp2_PLS_Gen_Acc.txt",what="character"))
+my_phen<-as.numeric(scan("Comp2_PLS_Phen_Acc.txt",what="character"))
+
+boxplot(my_integr,my_expr,my_meth,col=brewer.pal(3,"Dark2"),names=c("DIABLO","EXPR","METH"),ylab="T2D PREDICTION ACCURACY",main="Comparison of T2D Prediction between DIABLO and Individual OMICs")
+boxplot(my_integr,my_expr,my_meth,my_phen,my_gen,col=brewer.pal(5,"Dark2"),names=c("DIABLO","EXPR","METH","PHEN","GEN"),ylab="T2D PREDICTION ACCURACY",main="Comparison of T2D Prediction between DIABLO and Individual OMICs")
+```
+
+The conclusion we make here is that even though DIABLO marinally otperforms individual OMICs in sense of prediction accuracy, its prediction is largely driven by Expression and Methylation OMICs. So we do not see a dramatic boost in prediction when integrating multiple OMICs. This is probably due to the fact that Genotype and Phenotype OMICs do very poor prediction and puting it together with very predictive Methylation and Expression OMICs only contaminates the analysis.
+
+
+Now we will rank all the features from all the 4 OMICs by how much they contribute to the final prediction based on multiple train-test splits of the available samples.
+
+```{r bootstrapping,fig.width=10,fig.height=8}
+expr_features_comp1<-list(); expr_features_comp2<-list()
+meth_features_comp1<-list(); meth_features_comp2<-list()
+gen_features_comp1<-list(); gen_features_comp2<-list()
+phen_features_comp1<-list(); phen_features_comp2<-list()
+for(k in 1:N_repeat)
+{
+  print(paste0("Working with split No.", k))
+  gc()
+  set.seed(k+100)
+  test_samples<-selected_ind[sample(1:length(selected_ind),round(length(selected_ind)*0.2))]
+  train_samples<-selected_ind[!selected_ind%in%test_samples]
+  
+  Y.train<-as.factor(as.character(T2D[match(train_samples,rownames(T2D)),]))
+  Y.test<-as.factor(as.character(T2D[match(test_samples,rownames(T2D)),]))
+  
+  X.train_expr<-expr[match(train_samples,rownames(expr)),]
+  X.test_expr<-expr[match(test_samples,rownames(expr)),]
+  expr_plsda<-plsda(X.train_expr, Y.train, ncomp=2)
+  features_expr1<-names(head(sort(abs(expr_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+  features_expr2<-names(head(sort(abs(expr_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+  X.train_expr_selected_features<-subset(X.train_expr,select=unique(c(features_expr1, features_expr2)))
+  X.test_expr_selected_features<-subset(X.test_expr,select=unique(c(features_expr1, features_expr2)))
+  
+  X.train_meth<-meth[match(train_samples,rownames(meth)),]
+  X.test_meth<-meth[match(test_samples,rownames(meth)),]
+  meth_plsda<-plsda(X.train_meth, Y.train, ncomp=2)
+  features_meth1<-names(head(sort(abs(meth_plsda$loadings$X[,"comp1"]),decreasing=TRUE),50))
+  features_meth2<-names(head(sort(abs(meth_plsda$loadings$X[,"comp2"]),decreasing=TRUE),50))
+  X.train_meth_selected_features<-subset(X.train_meth,select=unique(c(features_meth1, features_meth2)))
+  X.test_meth_selected_features<-subset(X.test_meth,select=unique(c(features_meth1, features_meth2)))
+  
+  X.train_gen<-gen[match(train_samples,rownames(gen)),]
+  X.test_gen<-gen[match(test_samples,rownames(gen)),]
+  gen_plsda<-plsda(X.train_gen, Y.train, ncomp=2)
+  features_gen1<-names(head(sort(abs(gen_plsda$loadings$X[,"comp1"]),decreasing=TRUE),20))
+  features_gen2<-names(head(sort(abs(gen_plsda$loadings$X[,"comp2"]),decreasing=TRUE),20))
+  X.train_gen_selected_features<-subset(X.train_gen,select=unique(c(features_gen1, features_gen2)))
+  X.test_gen_selected_features<-subset(X.test_gen,select=unique(c(features_gen1, features_gen2)))
+  
+  X.train_phen<-phen[match(train_samples,rownames(phen)),]
+  X.test_phen<-phen[match(test_samples,rownames(phen)),]
+  
+  data.train<-list(expr=X.train_expr_selected_features, meth=X.train_meth_selected_features, 
+                   gen=X.train_gen_selected_features, phen=X.train_phen)
+  design=matrix(0.1, ncol=length(data.train), nrow=length(data.train), 
+                dimnames=list(names(data.train),names(data.train)))
+  diag(design)=0
+  design["expr","meth"]<-0.1
+  design["meth","expr"]<-0.1
+  design["meth","phen"]<-0.01
+  design["phen","meth"]<-0.01
+  design["expr","gen"]<-0.01
+  design["gen","expr"]<-0.01
+  design["meth","gen"]<-0.01
+  design["gen","meth"]<-0.01
+  
+  ncomp=2
+  list.keepX = list("expr"=c(30,30), "meth"=c(30,30), "gen"=c(5,5), "phen"=c(4,4))
+  res = block.splsda(X=data.train,Y=Y.train,ncomp=ncomp,keepX=list.keepX,design=design,
+                     scheme="horst",mode="regression",init="svd.single",near.zero.var=TRUE)
+  
+  expr_features_comp1[[k]]<-as.data.frame(rank(sort(abs(res$loadings$expr[,"comp1"]),decreasing=TRUE)))
+  colnames(expr_features_comp1[[k]])<-paste0("iter",k)
+  expr_features_comp1[[k]]$GENE<-rownames(expr_features_comp1[[k]])
+  expr_features_comp2[[k]]<-as.data.frame(rank(sort(abs(res$loadings$expr[,"comp2"]),decreasing=TRUE)))
+  colnames(expr_features_comp2[[k]])<-paste0("iter",k)
+  expr_features_comp2[[k]]$GENE<-rownames(expr_features_comp2[[k]])
+  
+  meth_features_comp1[[k]]<-as.data.frame(rank(sort(abs(res$loadings$meth[,"comp1"]),decreasing=TRUE)))
+  colnames(meth_features_comp1[[k]])<-paste0("iter",k)
+  meth_features_comp1[[k]]$GENE<-rownames(meth_features_comp1[[k]])
+  meth_features_comp2[[k]]<-as.data.frame(rank(sort(abs(res$loadings$meth[,"comp2"]),decreasing=TRUE)))
+  colnames(meth_features_comp2[[k]])<-paste0("iter",k)
+  meth_features_comp2[[k]]$GENE<-rownames(meth_features_comp2[[k]])
+  
+  gen_features_comp1[[k]]<-as.data.frame(rank(sort(abs(res$loadings$gen[,"comp1"]),decreasing=TRUE)))
+  colnames(gen_features_comp1[[k]])<-paste0("iter",k)
+  gen_features_comp1[[k]]$GENE<-rownames(gen_features_comp1[[k]])
+  gen_features_comp2[[k]]<-as.data.frame(rank(sort(abs(res$loadings$gen[,"comp2"]),decreasing=TRUE)))
+  colnames(gen_features_comp2[[k]])<-paste0("iter",k)
+  gen_features_comp2[[k]]$GENE<-rownames(gen_features_comp2[[k]])
+  
+  phen_features_comp1[[k]]<-as.data.frame(rank(sort(abs(res$loadings$phen[,"comp1"]),decreasing=TRUE)))
+  colnames(phen_features_comp1[[k]])<-paste0("iter",k)
+  phen_features_comp1[[k]]$GENE<-rownames(phen_features_comp1[[k]])
+  phen_features_comp2[[k]]<-as.data.frame(rank(sort(abs(res$loadings$phen[,"comp2"]),decreasing=TRUE)))
+  colnames(phen_features_comp2[[k]])<-paste0("iter",k)
+  phen_features_comp2[[k]]$GENE<-rownames(phen_features_comp2[[k]])
+  
+  print("***********************************************************")
+}
+```
+
+Finally. let us create a resulting list of features for each of the 4 OMICs ranked by their contribution to the T2D predictive model:
+
+```{r,fig.width=10,fig.height=8}
+expr_features_comp1_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),expr_features_comp1)
+rownames(expr_features_comp1_final)<-expr_features_comp1_final$GENE
+expr_features_comp1_final$GENE<-NULL
+expr_features_comp1_final[is.na(expr_features_comp1_final)]<-0
+expr_features_comp1_final$total_rank<-rowSums(expr_features_comp1_final)
+expr_features_comp1_final<-expr_features_comp1_final[order(-expr_features_comp1_final$total_rank),]
+print(head(expr_features_comp1_final,50))
+write.table(expr_features_comp1_final,file="Comp1_EXPR_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+expr_features_comp2_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),expr_features_comp2)
+rownames(expr_features_comp2_final)<-expr_features_comp2_final$GENE
+expr_features_comp2_final$GENE<-NULL
+expr_features_comp2_final[is.na(expr_features_comp2_final)]<-0
+expr_features_comp2_final$total_rank<-rowSums(expr_features_comp2_final)
+expr_features_comp2_final<-expr_features_comp2_final[order(-expr_features_comp2_final$total_rank),]
+print(head(expr_features_comp2_final,50))
+write.table(expr_features_comp2_final,file="Comp2_EXPR_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+
+meth_features_comp1_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),meth_features_comp1)
+rownames(meth_features_comp1_final)<-meth_features_comp1_final$GENE
+meth_features_comp1_final$GENE<-NULL
+meth_features_comp1_final[is.na(meth_features_comp1_final)]<-0
+meth_features_comp1_final$total_rank<-rowSums(meth_features_comp1_final)
+meth_features_comp1_final<-meth_features_comp1_final[order(-meth_features_comp1_final$total_rank),]
+print(head(meth_features_comp1_final,50))
+write.table(meth_features_comp1_final,file="Comp1_METH_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+meth_features_comp2_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),meth_features_comp2)
+rownames(meth_features_comp2_final)<-meth_features_comp2_final$GENE
+meth_features_comp2_final$GENE<-NULL
+meth_features_comp2_final[is.na(meth_features_comp2_final)]<-0
+meth_features_comp2_final$total_rank<-rowSums(meth_features_comp2_final)
+meth_features_comp2_final<-meth_features_comp2_final[order(-meth_features_comp2_final$total_rank),]
+print(head(meth_features_comp2_final,50))
+write.table(meth_features_comp2_final,file="Comp2_METH_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+
+gen_features_comp1_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),gen_features_comp1)
+rownames(gen_features_comp1_final)<-gen_features_comp1_final$GENE
+gen_features_comp1_final$GENE<-NULL
+gen_features_comp1_final[is.na(gen_features_comp1_final)]<-0
+gen_features_comp1_final$total_rank<-rowSums(gen_features_comp1_final)
+gen_features_comp1_final<-gen_features_comp1_final[order(-gen_features_comp1_final$total_rank),]
+print(head(gen_features_comp1_final,50))
+write.table(gen_features_comp1_final,file="Comp1_GEN_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+gen_features_comp2_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),gen_features_comp2)
+rownames(gen_features_comp2_final)<-gen_features_comp2_final$GENE
+gen_features_comp2_final$GENE<-NULL
+gen_features_comp2_final[is.na(gen_features_comp2_final)]<-0
+gen_features_comp2_final$total_rank<-rowSums(gen_features_comp2_final)
+gen_features_comp2_final<-gen_features_comp2_final[order(-gen_features_comp2_final$total_rank),]
+print(head(gen_features_comp2_final,50))
+write.table(gen_features_comp2_final,file="Comp2_GEN_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+
+phen_features_comp1_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),phen_features_comp1)
+rownames(phen_features_comp1_final)<-phen_features_comp1_final$GENE
+phen_features_comp1_final$GENE<-NULL
+phen_features_comp1_final[is.na(phen_features_comp1_final)]<-0
+phen_features_comp1_final$total_rank<-rowSums(phen_features_comp1_final)
+phen_features_comp1_final<-phen_features_comp1_final[order(-phen_features_comp1_final$total_rank),]
+print(head(phen_features_comp1_final,50))
+write.table(phen_features_comp1_final,file="Comp1_PHEN_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+
+phen_features_comp2_final<-Reduce(function(x,y) merge(x,y,by="GENE",all=TRUE),phen_features_comp2)
+rownames(phen_features_comp2_final)<-phen_features_comp2_final$GENE
+phen_features_comp2_final$GENE<-NULL
+phen_features_comp2_final[is.na(phen_features_comp2_final)]<-0
+phen_features_comp2_final$total_rank<-rowSums(phen_features_comp2_final)
+phen_features_comp2_final<-phen_features_comp2_final[order(-phen_features_comp2_final$total_rank),]
+print(head(phen_features_comp2_final,50))
+write.table(phen_features_comp2_final,file="Comp2_PHEN_FEATURES.txt",col.names=TRUE,row.names=TRUE,quote=FALSE,sep="\t")
+```
+
+We can perform a final integration on the top ranked features and visualize their connections via e.g. network analysis:
+
+```{r,fig.width=10,fig.height=8}
+expr_features_comp1_final<-read.delim("Comp1_EXPR_FEATURES.txt",header=TRUE,sep="\t")
+expr_features_comp2_final<-read.delim("Comp2_EXPR_FEATURES.txt",header=TRUE,sep="\t")
+meth_features_comp1_final<-read.delim("Comp1_METH_FEATURES.txt",header=TRUE,sep="\t")
+meth_features_comp2_final<-read.delim("Comp2_METH_FEATURES.txt",header=TRUE,sep="\t")
+gen_features_comp1_final<-read.delim("Comp1_GEN_FEATURES.txt",header=TRUE,sep="\t")
+gen_features_comp2_final<-read.delim("Comp2_GEN_FEATURES.txt",header=TRUE,sep="\t")
+phen_features_comp1_final<-read.delim("Comp1_PHEN_FEATURES.txt",header=TRUE,sep="\t")
+phen_features_comp2_final<-read.delim("Comp2_PHEN_FEATURES.txt",header=TRUE,sep="\t")
+
+#inclusion_cutoff<-0.3
+
+#features_expr1<-vector()
+#for(i in rownames(expr_features_comp1_final))
+#{
+#  if(sum(expr_features_comp1_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_expr1<-append(features_expr1,i)
+#  }
+#}
+#features_expr2<-vector()
+#for(i in rownames(expr_features_comp2_final))
+#{
+#  if(sum(expr_features_comp2_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_expr2<-append(features_expr2,i)
+#  }
+#}
+features_expr1<-rownames(expr_features_comp1_final)[1:50]
+features_expr2<-rownames(expr_features_comp2_final)[1:50]
+print("Gene expression features to keep:")
+print(unique(c(features_expr1, features_expr2)))
+X.expr_selected_features<-subset(expr,select=unique(c(features_expr1, features_expr2)))
+
+#features_meth1<-vector()
+#for(i in rownames(meth_features_comp1_final))
+#{
+#  if(sum(meth_features_comp1_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_meth1<-append(features_meth1,i)
+#  }
+#}
+#features_meth2<-vector()
+#for(i in rownames(meth_features_comp2_final))
+#{
+#  if(sum(meth_features_comp2_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_meth2<-append(features_meth2,i)
+#  }
+#}
+features_meth1<-rownames(meth_features_comp1_final)[1:50]
+features_meth2<-rownames(meth_features_comp2_final)[1:50]
+print("Methylation features to keep:")
+print(unique(c(features_meth1, features_meth2)))
+X.meth_selected_features<-subset(meth,select=unique(c(features_meth1, features_meth2)))
+
+#features_gen1<-vector()
+#for(i in rownames(gen_features_comp1_final))
+#{
+#  if(sum(gen_features_comp1_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_gen1<-append(features_gen1,i)
+#  }
+#}
+#features_gen2<-vector()
+#for(i in rownames(gen_features_comp2_final))
+#{
+#  if(sum(gen_features_comp2_final[i,]==0) < inclusion_cutoff*N_repeat)
+#  {
+#    features_gen2<-append(features_gen2,i)
+#  }
+#}
+features_gen1<-rownames(gen_features_comp1_final)[1:50]
+features_gen2<-rownames(gen_features_comp2_final)[1:50]
+print("Genotype features to keep:")
+print(unique(c(features_gen1, features_gen2)))
+X.gen_selected_features<-subset(gen,select=unique(c(features_gen1, features_gen2)))
+
+X.phen_selected_features<-phen
+
+  
+data<-list(expr=X.expr_selected_features, meth=X.meth_selected_features, 
+                 gen=X.gen_selected_features, phen=X.phen_selected_features)
+design=matrix(0.1, ncol=length(data), nrow=length(data), dimnames=list(names(data),names(data)))
+diag(design)=0
+design["expr","meth"]<-0.1
+design["meth","expr"]<-0.1
+design["meth","phen"]<-0.01
+design["phen","meth"]<-0.01
+design["expr","gen"]<-0.01
+design["gen","expr"]<-0.01
+design["meth","gen"]<-0.01
+design["gen","meth"]<-0.01
+  
+ncomp=2
+list.keepX = list("expr"=c(30,30), "meth"=c(30,30), "gen"=c(10,10), "phen"=c(4,4))
+res = block.splsda(X=data,Y=as.factor(T2D$T2D),ncomp=ncomp,keepX=list.keepX,design=design,
+                   scheme="horst",mode="regression",init="svd.single",near.zero.var=TRUE)
+  
+plotIndiv(res,legend=TRUE,title="Human Pancreatic Islets: Individual Omics",ellipse=FALSE,ind.names=TRUE,cex=3)
+plotArrow(res,ind.names=TRUE,legend=TRUE,title="Human Pancreatic Islets: Consensus Across Omics")
+plotLoadings(res, comp = 1, contrib = 'max', method = 'median')
+plotLoadings(res, comp = 2, contrib = 'max', method = 'median')
+plotDiablo(res, ncomp = 1)
+plotDiablo(res, ncomp = 2)
+plotVar(res,var.names=TRUE,style='graphics',legend=TRUE,pch=c(16,17,18,19),cex=c(0.8,0.8,0.8,0.8),col=c('blue','red2',"darkgreen","cyan"))
+circosPlot(res,cutoff=0.7,line=FALSE,size.variables=0.5)
+cimDiablo(res,margins=c(11,18))
+network(res,blocks=c(1,2),cex.node.name=0.6,color.node=c('blue','red2'),breaks=NULL)
+network(res,blocks=c(1,3),cex.node.name=0.6,color.node=c('blue','darkgreen'),breaks=NULL)
+network(res,blocks=c(1,4),cex.node.name=0.6,color.node=c('blue','cyan'),breaks=NULL)
+network(res,blocks=c(2,3),cex.node.name=0.6,color.node=c('red2','darkgreen'),breaks=NULL)
+network(res,blocks=c(2,4),cex.node.name=0.6,color.node=c('red2','cyan'),breaks=NULL)
+network(res,blocks=c(3,4),cex.node.name=0.6,color.node=c('darkgreen','cyan'),breaks=NULL)
+```
+
+Finally here is the details on the system on which this document was compiled:
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,473 @@
+---
+title: "Analysis of RNAseq Data from Human Pancreatic Islets"
+author: "Nikolay Oskolkov, SciLifeLab, NBIS Long Term Support, nikolay.oskolkov@scilifelab.se"
+date: "January 14, 2020"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+subtitle: PI Charlotte Ling, Lund University
+abstract: |
+  Here we will use the RNAseq data from Human Pancreatic Islets from individuals with and without Type 2 Diabetes (T2D) and perform diebetes status linear predictive analysis with PLS-DA model on 110 manually selected individuals with most reliable phenotypic information.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="/home/nikolay/WABI/C_Ling/Analysis_110ind_Selected/")
+```
+
+### The List of 110 Selected Individuals
+
+All the analysis will be performed on the 110 individuals whic were selected based on multiple criteria such as 1) they are either normo-glycimic or hyper-glycemic / T2D individuals, 2) they have information from all the 4 OMICS (methylation, transcriptomics, phenotypes, genotypes), 3) they all fall within the same age category, and a few other minor criteria. Now we will read the list of those 110 individuals and display a few of them:
+
+```{r}
+set.seed(1)
+selected_ind<-scan("OVERLAPPING_110_SAMPLES_4OMICS.txt", what = "charater")
+selected_ind<-paste0("ID",selected_ind)
+print(head(selected_ind, 20))
+print(tail(selected_ind, 20))
+```
+
+
+### Checking Human Islets Phenotypes
+
+We will start with the analysis of phenotypes available from approximately 300 Human Panctreatic Islets in order to check the relation between the phenotypes. Later this information will be taken into account when we do batch-effects correction. 
+The phenotype file below was provided by Human Tissue Lab (HTL) from Lund University Diabetes Center (LUDC), it includes phenotypic information from approximately 300 pancreatic islets donors. Not all of them will overlap with the methylation EPIC array, RNAseq and genotyping array samples but we still will use the info from all available donors in order to establish how phenotypes are correlated with each other. We start with reading the file and removing non-relevant phenotypes: 
+
+* HTL_donor_ID: Human Tissue Lab Donor ID)
+* NICS_donor_ID: Uppsala donor ID
+* Birth: redundant, captured by Age variable
+* HbA1c_mmol_mol: redundant, captured by HbA1c_perc
+* Blood_group: unlikely to be related to Type 2 Diabetes
+* Non_diabetic: redundant, captured by T2D variable
+* GAD: not related to T2D
+* Gestational: appropriate only for females, will be correlated with Sex
+* Date_isolated_islets: unlikely to be related to Type 2 Diabetes
+* Date_recieved_islets: unlikely to be related to Type 2 Diabetes
+* Islet_equivalences: unlikely to be related to Type 2 Diabetes
+* Diabetes_treatment: too sparse information
+
+We will also add information about Methylation EPIC Array batches and RNAseq batches (old vs. new chemistry) in order to see what phenotypes the batches correlate with. This is a potential denger if the batches happen to correlate with valuables phenotypes like T2D or HbA1c. As a control of noise level we will introduce a random variable, we will use it to check later how much of phenotypic variation can be explained by chance.
+
+```{r read phenotypes}
+htl<-read.csv("htl_donors.csv",header=TRUE,check.names=FALSE)
+htl$HTL_donor_ID<-paste0("ID",htl$HTL_donor_ID)
+phen_meth_array_batch<-read.delim("phenotypes_islets.txt",header=TRUE,row.names=1,check.names=FALSE,sep="\t")
+htl$Meth_Batch<-phen_meth_array_batch$batch[match(as.character(htl$HTL_donor_ID),rownames(phen_meth_array_batch))]
+htl$Meth_Batch[is.na(htl$Meth_Batch)]<-21
+phen_rnaseq_batch<-readRDS("phenotypes.RData")
+htl$RNA_Batch<-phen_rnaseq_batch$batch[match(as.character(htl$HTL_donor_ID),paste0("ID",gsub("Sample_","",phen_rnaseq_batch$sample_id)))]
+htl$Random<-log(sample(dim(htl)[1]))
+rownames(htl)<-htl$HTL_donor_ID
+
+htl$HTL_donor_ID<-NULL
+htl$NICS_donor_ID<-NULL
+htl$Birth<-NULL
+htl$HbA1c_mmol_mol<-NULL
+htl$Blood_group<-NULL
+htl$Non_diabetic<-NULL
+htl$GAD<-NULL
+htl$Gestational<-NULL
+htl$Date_isolated_islets<-NULL
+htl$Date_recieved_islets<-NULL
+htl$Islet_equivalences<-NULL
+htl$Diabetes_treatment<-NULL
+htl$RNA_Batch<-as.numeric(htl$RNA_Batch)
+head(htl)
+```
+
+For convenience we will rename HbA1c_perc to HbA1c, Stimulatory_index to SI, Purity_perc to Purity, Days_cultured to DIC. We will also assign donors with HbA1c > 6.5 to diabetics and balance the data set a bit better in this way. 
+
+```{r rename columns}
+names(htl)[names(htl)=="HbA1c_perc"]<-"HbA1c"
+names(htl)[names(htl)=="Stimulatory_index"]<-"SI"
+names(htl)[names(htl)=="Purity_perc"]<-"Purity"
+names(htl)[names(htl)=="Days_cultured"]<-"DIC"
+htl$T2D<-ifelse( ((is.na(htl$T2D)==FALSE & htl$T2D==1) | (is.na(htl$HbA1c)==FALSE  & htl$HbA1c>6.5)), 1, 0)
+head(htl)
+```
+
+Now let us assign "numeric" or "factor" status to the variables. For simplicity, we will treat a variable with less than 2 factor levels as "factor" data type, and else as "numeric" data type. DIC and Meth_Batch can also be considered as factors, however in this case we will need to do a multinomial (not a binomial/logistic) regression which is cumbersome, not clear how to extract adjusted R squared info, and most likely will not bring drammatically different results, so we will stick to only binomial/logistic regression for simplicity.
+
+```{r}
+for(i in 1:ncol(htl))
+{
+  if(length(levels(factor(htl[,i]))) > 2)
+  {
+    htl[,i]<-as.numeric(as.character(htl[,i]))
+  }
+  else
+  {
+    htl[,i]<-as.factor(htl[,i])
+  }
+}
+```
+
+Now we are going to select the 110 individuals with overlapping OMICs and keep only those individuals for further downstream analysis:
+
+```{r}
+htl<-htl[match(selected_ind,rownames(htl)),]
+head(htl)
+```
+
+Now let us calculate pair-wise linear regression for the phenotypes and extract the adjusted R squared information which is equaivalent to the fraction of variation in the response variable explained by the predictor variable. In case the response variable is a factor, we will be using logistic regression (Generalized Linear Model, GLM, with family = "binomial") and calculate the adjusted R suared as:
+
+$$R^2_{adj} = 1 - \frac{\rm{Residual Deviance}}{\rm{Null Deviance}}$$
+
+```{r heatmap phenotypes,fig.width=10,fig.height=8}
+phen_adj_r_squared<-matrix(NA,ncol=ncol(htl),nrow=ncol(htl))
+for(i in 1:ncol(htl))
+{
+  print(i)
+  for(j in 1:ncol(htl))
+  {
+    if(typeof(htl[,i])=="double" & (typeof(htl[,j])=="double" | typeof(htl[,j])=="integer"))
+    {
+      model<-suppressWarnings(lm(htl[,i]~htl[,j]))
+      phen_adj_r_squared[j,i]<-suppressWarnings(summary(model)$adj.r.squared)
+    }
+    if(typeof(htl[,i])=="integer" & typeof(htl[,j])=="double")
+    {
+      model<-suppressWarnings(lm(htl[,j]~htl[,i]))
+      phen_adj_r_squared[j,i]<-suppressWarnings(summary(model)$adj.r.squared)
+    }
+    if(typeof(htl[,i])=="integer" & typeof(htl[,j])=="integer")
+    {
+      model<-suppressWarnings(glm(htl[,i]~htl[,j],family="binomial"))
+      phen_adj_r_squared[j,i]<-1-model$deviance/model$null.deviance
+    }
+  }
+}
+phen_adj_r_squared<-as.data.frame(phen_adj_r_squared)
+colnames(phen_adj_r_squared)<-colnames(htl)
+rownames(phen_adj_r_squared)<-colnames(htl)
+phen_adj_r_squared[phen_adj_r_squared<0]<-0
+phen_adj_r_squared
+```
+
+Now we can plot the heatmap of the adjusted R squared statistics and check how phenotypes and batches are related to each other:
+
+```{r Phen Heatmap,fig.width=10,fig.height=8}
+library("pheatmap")
+pheatmap(phen_adj_r_squared, display_numbers=TRUE, fontsize=12, main="Human Islets Phenotypes: Adjusted R^2 of Association")
+```
+
+We can see that HbA1c and T2D are very strongly connected, they should since the T2D diagnostics relies on blood glucose level measurements. They also seem to be weakly related with BMI which also makes sense. Despite Age and Gender are believed to be a risk factor for T2D, we do not observe a reliable association between those three phenotypes in our sample. 
+
+Meth_Batch and RNA_Batch are strongly connected which must imply that the RNA sequencing and EPIC array experiemnts were sinchonized in time. The Methylation batch happily do not seem to influence any of the important phenotypes, perhaps only the Stimulatory Index (SI). However the RNAseq batch seems to slightly confound the T2D variable which is not good news, this means that removing the RNAseq batch we can remove some of the T2D variation. 
+
+There is astrange/unexpected observation following from the heatmap: DIC seem to be strangly but weakly correlated with the T2D status. The random variable sets the noise level which seems to be 1% of explained variance in this data set implying that all correlations with explained variance equal or below this estimate are most likely due to noise.
+
+
+### RNAseq Data from Human Pancreatic Islets
+
+The raw unnormalized counts were provided by Alexander Perfiliev from Lund University Diabetes Center (LUDC), the counts were generated by Salmon pseudo-aligner. TPM normalization which is by default used by Salmon might not be fully robust dues to the conversion to Simplex Space which it automatically does where Euclidean distance is not valid any more so all statistical methods like PCA etc. should be used with caution or with Aitchinson distance instead of Euclidean. In order to avoid this complication, we applied TMM/DESeq normalization to the Salmon raw counts. Let us read the expression matrix, keep only genes with non-zero counts for all samples above, and have a look at the data:
+
+```{r}
+library("matrixStats")
+expr<-suppressWarnings(as.data.frame(readRDS("export_deseq2_diabetes_nikolay.rds")))
+rownames(expr)<-substr(rownames(expr),1,15)
+colnames(expr)<-gsub("Sample_","ID",colnames(expr))
+expr<-expr[rowSums(expr)!=0,]
+expr<-subset(expr,select=selected_ind)
+expr[1:10,1:9]
+```
+
+Thus here we have non-zero expression values from `r dim(expr)[1]` genes and `r dim(expr)[2]` individuals. We have `r sum(as.character(htl$T2D)=="1")` diabetics in the initial meta info data set. Let us filter out genes with meadian count accross all samples below 1, this will remove lowly expressed genes which typically bring too much noise to the analysis. Let us also convert Ensembl IDs to gene symbols which will be easier to recognize and interpret.
+
+```{r}
+htl<-htl[match(colnames(expr),rownames(htl)),]
+head(htl)
+
+expr<-expr[rowMedians(as.matrix(expr[,rownames(htl)[htl$T2D==0]]))>=1 | rowMedians(as.matrix(expr[,rownames(htl)[htl$T2D==1]]))>=1,]
+#expr<-apply(expr,2,function(x) x/sum(x))
+
+Ensembl2GeneSymbol<-read.delim("ENSEMBLE_TO_GENE_SYMBOL_COORD_GENCODE29.txt",header=TRUE,sep="\t")
+head(Ensembl2GeneSymbol)
+IntersectGenes<-intersect(rownames(expr),as.character(Ensembl2GeneSymbol$ensembl_gene_id))
+Ensembl2GeneSymbol<-Ensembl2GeneSymbol[match(IntersectGenes,as.character(Ensembl2GeneSymbol$ensembl_gene_id)),]
+expr<-expr[match(IntersectGenes,rownames(expr)),]
+rownames(expr)<-make.names(Ensembl2GeneSymbol$external_gene_name,unique=TRUE)
+#refseq_hg38_genes<-scan("hg38_refseq_genes.txt",what="character")
+#expr<-expr[rownames(expr)%in%refseq_hg38_genes,]
+
+head(htl)
+dim(htl)
+expr[1:6,1:6]
+dim(expr)
+```
+
+Therefore we have `r sum(as.character(htl$T2D)=="1")` diabetics in the meta info data set that matches the expression data set. Now the expression and meta data are ready for analysis and we will start with a simple PCA in order to look at batch effects and other biological and technical variation. Later, we will proceed with Partial Least Squares (PLS) regression and finally will use it for prediction of diabetes status.
+
+
+### Preliminary Analysis with PCA
+
+Now we will perform preliminary PCA analysis. Fo this purpose, the expression matrix, which we will refer to as *X*, needs to be transposed. We will keep only top 10 PCs for evaluation.
+
+```{r}
+library("mixOmics")
+X<-as.data.frame(t(expr))
+X[1:10,1:10]
+dim(X)
+X<-log10(X+1)
+X[1:10,1:10]
+dim(X)
+hist(as.matrix(X),breaks=100)
+```
+
+```{r,fig.width=10,fig.height=8}
+pca.expr<-pca(X, ncomp=10, center=TRUE, scale=TRUE)
+pca.expr
+plot(pca.expr,ylim=c(0,0.2))
+```
+
+The PCA shows that about 50% of the total variance is explained by the first 4-5 principal components. We will visualize PC1 vs. PC2 dependence coloring samples according to their diabetes status, gender, date and purity:
+
+```{r,fig.width=10,fig.height=8}
+plotIndiv(pca.expr,group=as.factor(htl$T2D),ind.names=TRUE,ellipse=FALSE,legend=TRUE,title="PCA: RNAseq from Human Islets")
+plotIndiv(pca.expr,group=as.factor(htl$Gender),ind.names=TRUE,ellipse=FALSE,legend=TRUE,title="PCA: RNAseq from Human Islets")
+plotIndiv(pca.expr,group=htl$RNA_Batch,ind.names=TRUE,ellipse=FALSE,legend=TRUE,title="PCA: RNAseq from Human Islets")
+```
+
+We see obvious clustering by batch but not by T2D or Sex on genome-wide level. To further quantify genome-wide batch-effetcs let us display how much of variation in each principal component is explained by the batch variables:
+
+```{r heatmap batch effects,fig.width=10,fig.height=8}
+htl$DIC<-as.factor(htl$DIC)
+htl$Meth_Batch<-as.factor(htl$Meth_Batch)
+htl$RNA_Batch<-as.factor(htl$RNA_Batch)
+pc_adj_r_squared<-matrix(NA,ncol=dim(pca.expr$x)[2],nrow=dim(htl)[2])
+for(i in 1:dim(pca.expr$x)[2])
+{
+  print(i)
+  for(j in 1:dim(htl)[2])
+  {
+    pc_adj_r_squared[j,i]<-summary(lm(pca.expr$x[,i]~htl[,j]))$adj.r.squared
+  }
+}
+pc_adj_r_squared<-as.data.frame(pc_adj_r_squared)
+colnames(pc_adj_r_squared)<-colnames(pca.expr$x)
+rownames(pc_adj_r_squared)<-colnames(htl)
+pc_adj_r_squared[pc_adj_r_squared<0]<-0
+pc_adj_r_squared
+
+library("pheatmap")
+pheatmap(pc_adj_r_squared, display_numbers=TRUE, fontsize=12, cluster_cols=FALSE, main="Human Islets RNAseq: Adj R^2 of Association between PCs and Phenotypes")
+```
+
+The heatmap shows a heavy dominance of RNAseq batches for all PCs. Other technical variables like Purity and DIC are also important for many PCs especialy PC4. Stimulatory index and Age only wekly contribute to some PCs. T2D and HbA1c seem to weakly contribute to PC3-4. BMI becomes somehow important only for PC8. 
+
+Therefore we conclude that the biological signal (T2D) is hidden and covered by lots of technological noise. We need to urgently clean the expression data set from batch-effects. However, it is a naive idea to use ComBat and remove the batch because both T2D / HbA1c and the batch contribute to PC3, i.e. they are confounded, so removing the batch might remove some T2D / HbA1c related variation, I tried it and the result was not good, no T2D / HbA1c variation was left. Since T2D / HbA1c contribute to PC3-4 it is informative to look at the top loading of PC3-4 to have some idea which genes drive this component:
+
+
+```{r,fig.width=10,fig.height=8}
+plotLoadings(pca.expr,comp=3,method='median',contrib='max',ndisplay=20)
+head(sort(abs(pca.expr$loadings$X[,"PC3"]),decreasing=TRUE),20)
+plotLoadings(pca.expr,comp=4,method='median',contrib='max',ndisplay=20)
+head(sort(abs(pca.expr$loadings$X[,"PC4"]),decreasing=TRUE),20)
+```
+
+
+
+### PLS-DA Analysis of RNAdseq Gene Expression Data
+
+Now we will perform PLS-DA analysis, for this purpose we are going to construct the X and Y matrices in order to maximize their covariance, cov(X,Y):
+
+```{r}
+gc()
+library("mixOmics")
+Y<-as.factor(as.character(htl$T2D))
+summary(Y)
+```
+
+We have approximetaly 29% of T2D individuals which is not crazy unbalanced, so there is a hope that the model does not learn only the majority class. Important to mention that a very naive / stupid classifier that predicts Non-T2D for any given individual should thus achieve 71% accuracy of classification. So our PLS-DA model should be better than the naive classifier and outperform the lower threshold of 71%.
+
+```{r}
+my_folds=2
+my_nrepeat=10
+my_progressBar=FALSE
+my_cpus=1
+```
+```{r perf plsda,fig.width=10,fig.height=8}
+gc()
+expr_plsda.perf<-plsda(X, Y, ncomp=10)
+
+ptm<-proc.time()
+perf.plsda<-perf(expr_plsda.perf, validation='Mfold', folds=my_folds, progressBar=my_progressBar, nrepeat=my_nrepeat)
+proc.time()-ptm
+
+perf.plsda
+
+head(perf.plsda$error.rate)
+
+head(perf.plsda$error.rate.class)
+
+plot(perf.plsda,overlay='dist',sd=TRUE)
+```
+
+We can see that the BER Mahalanobis seems to reach its plateau or weak minimum at ncomp=4, so we will use 4 PLS components for further PLS-DA analysis.
+
+```{r pls-da,fig.width=10,fig.height=8}
+gc()
+expr_plsda<-plsda(X, Y, ncomp=4)
+expr_plsda$explained_variance
+background = background.predict(expr_plsda, comp.predicted=2, dist = "mahalanobis.dist") 
+plotIndiv(expr_plsda, comp=c(1,2), group=Y, ind.names=TRUE, ellipse=FALSE, background=background, legend=TRUE, title="Human Pancreatic Islets: PLS-DA of RNAseq Gene Expression")
+```
+
+Plotting the loadings of the two PLS components we can see which genes are responsible for the linear separation of the T2D and non-T2D individuals:
+
+```{r pls comp,fig.width=10,fig.height=8}
+plotLoadings(expr_plsda, comp=1, method='median', contrib='max', ndisplay=20)
+plotLoadings(expr_plsda, comp=2, method='median', contrib='max', ndisplay=20)
+```
+
+
+### Sparse PLS-DA Analysis of RNAseq Gene Expression Data
+
+Many of the genes included to the PLS-DA analysis are actually non-informative and bring noise to the analysis. Therefore one needs to apply sparse cleaning algorithm to select a subset of genes that best discriminate between diabetics and non diabetics. We will use LASSO for selection of most informative genes. The tuning procedure below is performed on one component at a time and selects an optimal number of genes that provide lowest error rate. Since from the previous analysis we concluded that the minimal error rate is achieved on the first 4 principal components, we will use ncomp=4 in the sPLS-DA analysis. 
+
+```{r tune splsda,fig.width=10,fig.height=8}
+gc()
+list.keepX<-c(1:10,seq(20,50,10))
+
+ptm<-proc.time()
+tune.splsda.islets<-tune.splsda(X,Y,ncomp=4,validation='Mfold',folds=my_folds,progressBar=my_progressBar,dist='mahalanobis.dist',test.keepX=list.keepX,nrepeat=my_nrepeat)
+proc.time()-ptm
+
+head(tune.splsda.islets$error.rate)
+tune.splsda.islets$choice.keepX
+plot(tune.splsda.islets,optimal=TRUE,sd=TRUE)
+```
+
+```{r plot splsda,fig.width=10,fig.height=8}
+gc()
+select.keepX<-as.numeric(tune.splsda.islets$choice.keepX)
+splsda.islets<-splsda(X, Y, ncomp=4, keepX=select.keepX)
+background = background.predict(splsda.islets, comp.predicted=2, dist = "mahalanobis.dist")
+plotIndiv(splsda.islets,comp=c(1,2),group=Y,ind.names=TRUE,ellipse=FALSE,background=background,legend=TRUE,title="Human Pancreatic Islets: PLS-DA of RNAseq Gene Expression")
+
+plotVar(splsda.islets,comp=c(1,2),var.names=list(rownames(expr)),cex=3)
+head(sort(abs(splsda.islets$loadings$X[,"comp1"]),decreasing=TRUE),10)
+head(sort(abs(splsda.islets$loadings$X[,"comp2"]),decreasing=TRUE),10)
+plotLoadings(splsda.islets,comp=1,method='median',contrib='max',ndisplay=20)
+plotLoadings(splsda.islets,comp=2,method='median',contrib='max',ndisplay=20)
+cim(splsda.islets,row.sideColors=color.mixo(Y),margins=c(8,4))
+```
+
+
+### Predicting T2D Status from sPLS-DA Model
+
+Finally we will randomly split the RNAseq data set into training (80% of samples) and validation (20% of samples) sets. This is needed to validate predictions of sPLS-DA trained on the training data set. 
+
+We are going to perform again the tuning of the sPLS-DA model on the training data set. From the previous analysis we know that first 4 PLS components minimize the mahalanobis.dist balanced error rate, so we will use ncomp = 4 and re-tune the optimal numbers of genes although they should be quite similar to the ones obtained in the previous section as the training set comprises 80% of the full data set. For this purpose, we will choose again a small step of the gene grid list.keepX. Now we will apply the tuned and trained model to the validation data set and generate predictions of T2D status and compute the accuracy of the prediction.
+
+The accuracy of T2D vs NonT2D classification is very high, much higher than the 71% accuracy of the naive model. Now we will build confidence intervals by splitting the data set into train and test multiple times and running the PLS-DA classifier for every split.
+
+```{r tune splsda train conf interval,fig.width=10,fig.height=8,eval = TRUE}
+gc()
+N_repeat<-100
+library("mixOmics")
+library("ROCit")
+test_samples<-selected_ind[sample(1:length(selected_ind),round(length(selected_ind)*0.2))]
+train_samples<-selected_ind[!selected_ind%in%test_samples]
+comp1_auc<-vector()
+comp1_tpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_fpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_auc<-vector()
+comp2_tpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp2_fpr<-matrix(NA,ncol=length(test_samples)+1,nrow=N_repeat)
+comp1_acc<-vector()
+comp2_acc<-vector()
+for(k in 1:N_repeat)
+{
+  print(paste0("Working with split No.", k))
+  gc()
+  set.seed(k+100)
+  test_samples<-colnames(expr)[sample(1:length(colnames(expr)),round(length(colnames(expr))*0.2))]
+  train_samples<-colnames(expr)[!colnames(expr)%in%test_samples]
+  
+  X.train<-X[match(train_samples,rownames(X)),]
+  X.test<-X[match(test_samples,rownames(X)),]
+  Y.train<-as.factor(as.character(htl[match(train_samples,rownames(htl)),]$T2D))
+  Y.test<-as.factor(as.character(htl[match(test_samples,rownames(htl)),]$T2D))
+  
+  list.keepX<-c(1:10,seq(20,50,10))
+  tune.splsda.train.expr<-tune.splsda(X.train, Y.train, ncomp=4, validation='Mfold', folds=my_folds,
+                                     progressBar=my_progressBar, dist='mahalanobis.dist', logratio="none",
+                                     test.keepX=list.keepX, nrepeat=my_nrepeat)
+  splsda.expr.train<-splsda(X.train, Y.train, logratio='none', ncomp=4,
+                           keepX=as.numeric(tune.splsda.train.expr$choice.keepX))
+  
+  splsda.expr.predict<-predict(splsda.expr.train, X.test, dist='mahalanobis.dist')
+  
+  expr_predict1<-splsda.expr.predict$predict[,,1][,2]
+  roc_obj1<-rocit(as.numeric(expr_predict1),as.numeric(as.character(Y.test)))
+  expr_predict2<-splsda.expr.predict$predict[,,2][,2]
+  roc_obj2<-rocit(as.numeric(expr_predict2),as.numeric(as.character(Y.test)))
+  
+  comp1_auc<-append(comp1_auc,roc_obj1$AUC)
+  print(paste0("Classification ROC AUC from Expression PLS Component 1: ", roc_obj1$AUC))
+  comp1_tpr[k,]<-roc_obj1$TPR
+  comp1_fpr[k,]<-roc_obj1$FPR
+  comp2_auc<-append(comp2_auc,roc_obj2$AUC)
+  print(paste0("Classification ROC AUC from Expression PLS Component 2: ", roc_obj2$AUC))
+  comp2_tpr[k,]<-roc_obj2$TPR
+  comp2_fpr[k,]<-roc_obj2$FPR
+  
+  print(table(splsda.expr.predict$class$mahalanobis.dist[,1],Y.test))
+  acc1<-round((sum(diag(table(splsda.expr.predict$class$mahalanobis.dist[,1],Y.test)))/sum(table(splsda.expr.predict$class$mahalanobis.dist[,1],Y.test)))*100)
+  print(paste0("Classification Accuracy from PLS Component 1: ", acc1))
+  print(table(splsda.expr.predict$class$mahalanobis.dist[,2],Y.test))
+  acc2<-round((sum(diag(table(splsda.expr.predict$class$mahalanobis.dist[,2],Y.test)))/sum(table(splsda.expr.predict$class$mahalanobis.dist[,2],Y.test)))*100)
+  print(paste0("Classification Accuracy from PLS Component 2: ", acc2))
+  
+  comp1_acc<-append(comp1_acc,acc1)
+  comp2_acc<-append(comp2_acc,acc2)
+  print("***********************************************************")
+}
+plot(colMeans(comp1_fpr),colMeans(comp1_tpr),col="red",type="o",ylab="SENSITIVITY (TPR)",xlab="1-SPECIFISITY (FPR)",pch=19)
+lines(colMeans(comp2_fpr),colMeans(comp2_tpr),col="blue",type="o",pch=19)
+lines(c(0,1),c(0,1),col="black")
+legend("bottomright",legend=c(paste0("EXPR PLS COMP1 AUC = ",round(mean(comp1_auc),2)," +/- ",round(2*sd(comp1_auc),2)),paste0("EXPR PLS COMP2 AUC = ",round(mean(comp2_auc),2)," +/- ",round(2*sd(comp2_auc),2))),col=c("red","blue"),inset=0.02,lty=c(1,1))
+
+write.table(comp1_auc,file="Comp1_PLS_Expr_AUC.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_tpr,file="Comp1_PLS_Expr_TPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_fpr,file="Comp1_PLS_Expr_FPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_auc,file="Comp2_PLS_Expr_AUC.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_tpr,file="Comp2_PLS_Expr_TPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_fpr,file="Comp2_PLS_Expr_FPR.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp1_acc,file="Comp1_PLS_Expr_Acc.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+write.table(comp2_acc,file="Comp2_PLS_Expr_Acc.txt",col.names=FALSE,row.names=FALSE,quote=FALSE,sep="\t")
+```
+
+```{r,fig.width=10,fig.height=8}
+gc()
+comp1_acc_arch<-as.numeric(scan("Comp1_PLS_Expr_Acc.txt",what="character"))
+comp2_acc_arch<-as.numeric(scan("Comp2_PLS_Expr_Acc.txt",what="character"))
+
+#comp1_acc_arch<-c(comp1_acc,comp1_acc_arch)
+#comp2_acc_arch<-c(comp2_acc,comp2_acc_arch)
+
+hist(comp1_acc_arch,breaks=20,xlab="ACCURACY",main="Accuracy T2D Prediction from RNAseq: PLS1",col="darkgreen")
+abline(v=71,col="red",lwd=5)
+mtext(paste0("Accuracy = ",mean(comp1_acc_arch)," +/- ",2*sd(comp1_acc_arch)))
+hist(comp2_acc_arch,breaks=20,xlab="ACCURACY",main="Accuracy T2D Prediction from RNAseq: PLS2",col="darkgreen")
+abline(v=71,col="red",lwd=5)
+mtext(paste0("Accuracy = ",mean(comp2_acc_arch)," +/- ",2*sd(comp2_acc_arch)))
+```
+
+We can compute how significantly different is the accuracy of the PLS-DA model compared to the naive 71% accuracy:
+
+```{r}
+gc()
+sum(comp1_acc_arch<=71)/length(comp1_acc_arch)
+sum(comp2_acc_arch<=71)/length(comp2_acc_arch)
+rm(list=ls())
+gc()
+```
+
+Finally here is the details on the system on which this document was compiled:
+```{r}
+sessionInfo()
+```
